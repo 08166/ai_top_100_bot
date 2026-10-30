@@ -15,12 +15,14 @@ import sys
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
+from dotenv import load_dotenv
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("echobot")
 
 # ── Config ───────────────────────────────────────────────────────────
+load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 KAKAO_GW_URL = "wss://bot-gateway.kakao.com/gateway"

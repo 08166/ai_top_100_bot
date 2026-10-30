@@ -59,9 +59,9 @@
 |---|---|
 | `bot-test.py` | 게이트웨이 연결, heartbeat, `MESSAGE_CREATE` 수신 → callback 응답 |
 | `Dockerfile` | `requirements-stage` → `base-stage` → `develop-stage` / `production-stage` |
-| `compose.yaml` | 로컬·배포 공통 설정 (build context, init, env_file) |
-| `compose.override.yaml` | 로컬 개발용. `docker compose up` 하면 자동으로 같이 읽힘 |
-| `compose.production.yaml` | 배포용. `-f`로 직접 지정해야 읽힘 |
+| `docker-compose.yaml` | 로컬·배포 공통 설정 (build context, init, env_file) |
+| `docker-compose.override.yaml` | 로컬 개발용. `docker compose up` 하면 자동으로 같이 읽힘 |
+| `docker-compose.production.yaml` | 배포용. `-f`로 직접 지정해야 읽힘 |
 | `00.context_guidelines.md` | 대회 정보와 작업 지침 |
 
 Dockerfile 스테이지를 나눈 이유는 테스트 의존성 때문이다.
@@ -129,20 +129,20 @@ poetry add --group test {패키지}     # 테스트 전용 의존성
 1. 배포 이미지 빌드 (로컬)
    ```sh
    export BOT_IMAGE_TAG=0.1.0
-   docker compose -f compose.yaml -f compose.production.yaml build
+   docker compose -f docker-compose.yaml -f docker-compose.production.yaml build
    ```
    - `BOT_IMAGE_TAG`가 없으면 compose가 바로 실패함. 태그 없이 배포되는 실수를 막기 위해서다
 1. 이미지와 설정 파일 전송
    ```sh
    docker save kakao-bot:$BOT_IMAGE_TAG | gzip | ssh {user}@{host} docker load
    ssh {user}@{host} 'mkdir -p ~/kakao-bot'
-   scp compose.yaml compose.production.yaml .env {user}@{host}:~/kakao-bot/
+   scp docker-compose.yaml docker-compose.production.yaml .env {user}@{host}:~/kakao-bot/
    ```
 1. 서버에서 실행
    ```sh
    cd ~/kakao-bot && chmod 600 .env
-   BOT_IMAGE_TAG=0.1.0 docker compose -f compose.yaml -f compose.production.yaml up -d --no-build
-   docker compose -f compose.yaml -f compose.production.yaml logs -f bot
+   BOT_IMAGE_TAG=0.1.0 docker compose -f docker-compose.yaml -f docker-compose.production.yaml up -d --no-build
+   docker compose -f docker-compose.yaml -f docker-compose.production.yaml logs -f bot
    ```
 
 배포 설정에서 정해둔 것:
