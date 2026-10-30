@@ -21,5 +21,6 @@ CMD ["python", "bot-test.py"]
 
 FROM base-stage AS production-stage
 COPY bot-test.py /app/
+COPY prompts/ /app/prompts/
 USER bot
 CMD ["python", "bot-test.py"]
