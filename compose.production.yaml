@@ -1,0 +1,12 @@
+services:
+  bot:
+    image: kakao-bot:${BOT_IMAGE_TAG:?BOT_IMAGE_TAG required}
+    build:
+      target: production-stage
+    platform: linux/amd64
+    restart: on-failure:3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,24 @@
+[project]
+name = "kakao-bot"
+version = "0.1.0"
+description = ""
+authors = [
+    { name = "이선호", email = "j76067469@gmail.com" }
+]
+
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "httpx (>=0.28.1,<0.29.0)",
+    "websockets (>=17.3,<18.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+test = [
+    "pytest (>=9.2.0,<10.0.0)",
+    "pytest-watcher (>=0.6.3,<0.7.0)"
+]

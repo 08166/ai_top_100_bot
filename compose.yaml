@@ -1,0 +1,7 @@
+services:
+  bot:
+    build:
+      context: .
+    init: true
+    env_file:
+      - .env
