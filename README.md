@@ -146,7 +146,7 @@ poetry add --group test {패키지}     # 테스트 전용 의존성
 
 배포 설정에서 정해둔 것:
 
-- `restart: on-failure:3` — 네트워크 끊김은 코드 안에서 재연결함. 프로세스가 죽는 건 인증 실패(4001)·중복 연결(4004) 같은 치명 오류라서 무한 재시작하지 않게 3회로 제한
+- `restart: unless-stopped` — 심사 기간(10/31 16:00 ~ 11/1 24:00)에는 봇을 손대지 않고 계속 살려둬야 한다. `on-failure`는 서버·Docker 재부팅 시 컨테이너를 다시 띄우지 않아서, 비정상 종료와 데몬 재시작 모두에서 재기동하는 `unless-stopped`로 둔다. 서버에서 `systemctl is-enabled docker`가 `enabled`인지도 확인한다
 - `init: true` — `docker stop`의 SIGTERM이 python 프로세스까지 전달되게 함
 - 로그는 `json-file` 10MB × 3개로 순환. 메시지마다 INFO 로그가 쌓여서 디스크가 차는 걸 막기 위해서다
 

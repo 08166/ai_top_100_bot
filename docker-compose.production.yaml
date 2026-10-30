@@ -2,7 +2,8 @@ services:
   bot:
     build:
       target: production-stage
-    restart: on-failure:3
+    # 심사 기간 무인 운영: 비정상 종료와 서버·Docker 재부팅 모두에서 다시 띄움 (on-failure는 데몬 재시작 시 재기동 안 함)
+    restart: unless-stopped
     logging:
       driver: json-file
       options:
