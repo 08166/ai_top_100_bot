@@ -142,7 +142,23 @@ poetry add --group test {패키지}     # 테스트 전용 의존성
    - 로그에 `READY — bot id=...`가 찍히면 게이트웨이 연결 성공
    - 로컬에서 같은 토큰으로 봇을 띄워둔 상태면 close 4004로 충돌하니 로컬은 먼저 내림
 
-> :warning: `docker system prune -af --volumes`는 배포 명령에 붙여 쓰지 않는다. 실행 중이 아닌 모든 컨테이너·이미지·볼륨을 지워서, 서버의 다른 서비스 데이터까지 날아갈 수 있고 빌드 캐시도 매번 사라진다. 디스크 정리가 필요하면 `docker image prune -f` 정도로 범위를 좁힌다.
+> :warning: `docker system prune -af --volumes`는 배포 명령에 붙여 쓰지 않는다. 실행 중이 아닌 모든 컨테이너·이미지·볼륨을 지워서, 서버의 다른 서비스 데이터까지 날아갈 수 있고 빌드 캐시도 매번 사라진다. 디스크 정리가 필요하면 `docker image prune -f` 정도로 범위를 좁힌다. 특히 대화 기록 볼륨(`conversation-logs`)이 같이 지워지므로 `docker compose down -v`도 쓰지 않는다.
+
+## 대화 기록
+
+메시지 한 건마다 받은 메시지, 이벤트 원본(`callbackToken` 제외, `event_json`), 봇 답변, 처리 결과(`ok`/`fallback`/`refusal`/`error`), 응답 시간, Claude `request_id`·토큰 수, callback 응답 코드를 SQLite `/app/data/conversations.db`의 `conversations` 테이블에 한 행씩 저장한다.
+WAL 모드라서 봇이 기록하는 중에도 읽을 수 있다. 배포 환경에서는 named volume `conversation-logs`에 저장돼서 재빌드·재시작해도 유지된다. 심사관 메시지가 담기므로 DB 파일은 `0600`으로 만들고 git·이미지에서 제외한다(`data/`). 외부 공유 금지.
+
+```sh
+# 최근 5건 확인 (읽기 전용 연결, 이미지에 sqlite3 CLI가 없어서 python 사용)
+docker compose -f docker-compose.yaml -f docker-compose.production.yaml exec bot \
+  python -c "import sqlite3; c=sqlite3.connect('file:/app/data/conversations.db?mode=ro', uri=True); print(c.execute('select id, received_at, outcome, latency_ms, content from conversations order by id desc limit 5').fetchall())"
+
+# 심사 종료 후 회수: WAL 내용까지 포함한 스냅샷을 /tmp에 만든 뒤 복사 (볼륨은 건드리지 않음)
+docker compose -f docker-compose.yaml -f docker-compose.production.yaml exec bot \
+  python -c "import sqlite3; s=sqlite3.connect('/app/data/conversations.db'); d=sqlite3.connect('/tmp/judge.db'); s.backup(d); d.close(); s.close()"
+docker compose -f docker-compose.yaml -f docker-compose.production.yaml cp bot:/tmp/judge.db ./judge.db
+```
 
 배포 설정에서 정해둔 것:
 

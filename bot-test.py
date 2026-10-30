@@ -2,7 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
@@ -30,6 +34,7 @@ CLAUDE_MAX_RETRIES = int(os.getenv("CLAUDE_MAX_RETRIES", "1"))
 MAX_CONCURRENT_REPLIES = int(os.getenv("MAX_CONCURRENT_REPLIES", "4"))
 SYSTEM_PROMPT_PATH = BASE_DIR / os.getenv("SYSTEM_PROMPT_PATH", "prompts/system.txt")
 FALLBACK_REPLY_PATH = BASE_DIR / os.getenv("FALLBACK_REPLY_PATH", "prompts/fallback.txt")
+CONVERSATION_DB_PATH = BASE_DIR / os.getenv("CONVERSATION_DB_PATH", "data/conversations.db")
 
 KAKAO_GW_URL = "wss://bot-gateway.kakao.com/gateway"
 KAKAO_API_URL = "https://kapi.kakao.com"
@@ -58,6 +63,68 @@ RECONNECT_BACKOFF_SEC = 3.0
 _inflight: set[asyncio.Task] = set()
 
 
+# ── 대화 기록 ────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class AgentReply:
+    """Claude 답변과 기록에 남길 처리 결과."""
+    text: str
+    outcome: str                 # ok | fallback | refusal | error
+    request_id: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+class ConversationLog:
+    """대화 한 건을 SQLite conversations 테이블에 한 행으로 저장한다."""
+
+    SCHEMA = """
+        CREATE TABLE IF NOT EXISTS conversations (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at     TEXT    NOT NULL,
+            content         TEXT,
+            event_json      TEXT    NOT NULL,
+            reply           TEXT    NOT NULL,
+            outcome         TEXT    NOT NULL,
+            latency_ms      INTEGER,
+            model           TEXT,
+            request_id      TEXT,
+            input_tokens    INTEGER,
+            output_tokens   INTEGER,
+            callback_status INTEGER
+        )
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # 심사관 메시지가 담기므로 DB 파일을 소유자 전용(0600)으로 먼저 만들어 둠
+        os.close(os.open(db_path, os.O_WRONLY | os.O_CREAT, 0o600))
+        self.conn = sqlite3.connect(db_path)
+        # 기록 중에도 회수 스크립트가 읽을 수 있게 WAL, 잠깐의 잠금 경합은 대기
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
+        with self.conn:
+            self.conn.execute(self.SCHEMA)
+
+    def record(self, entry: dict) -> None:
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO conversations (
+                       received_at, content, event_json, reply, outcome, latency_ms,
+                       model, request_id, input_tokens, output_tokens, callback_status
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    entry["received_at"], entry["content"],
+                    json.dumps(entry["event"], ensure_ascii=False, default=str),
+                    entry["reply"], entry["outcome"], entry["latency_ms"],
+                    entry["model"], entry["request_id"],
+                    entry["input_tokens"], entry["output_tokens"], entry["callback_status"],
+                ),
+            )
+
+    def close(self) -> None:
+        self.conn.close()
+
+
 # ── Claude 답변 생성 ─────────────────────────────────────────────────
 class ClaudeAgent:
     """시스템 프롬프트를 들고 사용자 메시지 하나에 대한 Claude 답변을 만든다."""
@@ -70,7 +137,7 @@ class ClaudeAgent:
         # 동시에 몰려도 Claude 호출 수를 제한해서 rate limit과 비용 폭주를 막음
         self.limiter = asyncio.Semaphore(max_concurrent)
 
-    async def reply(self, user_text: str) -> str:
+    async def reply(self, user_text: str) -> AgentReply:
         try:
             async with self.limiter:
                 response = await self.client.beta.messages.create(
@@ -85,22 +152,27 @@ class ClaudeAgent:
                 )
         except anthropic.APIStatusError as e:
             log.error("claude status error — %d %s", e.status_code, e.message)
-            return self.fallback_reply
+            return AgentReply(self.fallback_reply, "error")
         except anthropic.APIConnectionError as e:
             log.error("claude connection error — %s", e)
-            return self.fallback_reply
+            return AgentReply(self.fallback_reply, "error")
 
+        usage = (response._request_id, response.usage.input_tokens, response.usage.output_tokens)
         if response.stop_reason == "refusal":
             log.warning("claude refusal — request_id=%s", response._request_id)
-            return self.fallback_reply
+            return AgentReply(self.fallback_reply, "refusal", *usage)
 
         text = "".join(b.text for b in response.content if b.type == "text").strip()
-        return text[:SIMPLE_TEXT_MAX_CHARS] or self.fallback_reply
+        if not text:
+            return AgentReply(self.fallback_reply, "fallback", *usage)
+        return AgentReply(text[:SIMPLE_TEXT_MAX_CHARS], "ok", *usage)
 
 
 # ── 메시지 처리 ──────────────────────────────────────────────────────
-async def on_message(d: dict, agent: ClaudeAgent) -> None:
-    """MESSAGE_CREATE 이벤트를 받아 Claude 답변을 callback으로 돌려준다."""
+async def on_message(d: dict, agent: ClaudeAgent, conversation_log: ConversationLog) -> None:
+    """MESSAGE_CREATE 이벤트를 받아 Claude 답변을 callback으로 돌려주고 대화를 기록한다."""
+    received_at = datetime.now(timezone.utc)
+    started = time.monotonic()
     content = d.get("content", "")
     callback_token = d.get("callbackToken", "")
     log.info("MESSAGE_CREATE — content=%s", content[:100])
@@ -109,16 +181,36 @@ async def on_message(d: dict, agent: ClaudeAgent) -> None:
         log.error("callbackToken 누락 — skip")
         return
 
-    answer = await agent.reply(content)
+    reply = await agent.reply(content)
+    callback_status: int | None = None
     try:
-        await send_callback(callback_token, answer)
+        callback_status = await send_callback(callback_token, reply.text)
     except httpx.HTTPError as e:
         # 별도 Task에서 돌기 때문에 여기서 잡지 않으면 예외가 로그 없이 사라짐
         log.error("callback request failed — %s", e)
 
+    try:
+        conversation_log.record({
+            "received_at": received_at.isoformat(),
+            "content": content,
+            # callbackToken은 1회용 자격증명이라 남기지 않음
+            "event": {k: v for k, v in d.items() if k != "callbackToken"},
+            "reply": reply.text,
+            "outcome": reply.outcome,
+            "latency_ms": round((time.monotonic() - started) * 1000),
+            "model": CLAUDE_MODEL,
+            "request_id": reply.request_id,
+            "input_tokens": reply.input_tokens,
+            "output_tokens": reply.output_tokens,
+            "callback_status": callback_status,
+        })
+    except sqlite3.Error as e:
+        # 기록 실패가 답장 흐름을 막지 않게 로그만 남김
+        log.error("conversation log write failed — %s", e)
+
 
 # ── 봇 callback ──────────────────────────────────────────
-async def send_callback(callback_token: str, text: str) -> None:
+async def send_callback(callback_token: str, text: str) -> int:
     """봇 callback 엔드포인트로 카카오 스킬 응답(simpleText)을 전송한다."""
     url = f"{KAKAO_API_URL}/v1/bot/callback"
     body = {
@@ -138,6 +230,7 @@ async def send_callback(callback_token: str, text: str) -> None:
         resp = await client.post(url, json=body, headers=headers)
     if resp.status_code != 200:
         log.error("callback failed — %d %s", resp.status_code, resp.text)
+    return resp.status_code
 
 
 # ── 세션 상태 ────────────────────────────────────────────────────────
@@ -157,7 +250,8 @@ class Session:
 
 
 # ── WebSocket 게이트웨이 ─────────────────────────────────────────────
-async def gateway_loop(session: Session, agent: ClaudeAgent) -> None:
+async def gateway_loop(session: Session, agent: ClaudeAgent,
+                       conversation_log: ConversationLog) -> None:
     """게이트웨이에 한 번 연결해 핸드셰이크 후 heartbeat·수신 루프를 동시에 돈다."""
     log.info("connecting to %s", KAKAO_GW_URL)
     async with websockets.connect(KAKAO_GW_URL) as ws:
@@ -187,7 +281,7 @@ async def gateway_loop(session: Session, agent: ClaudeAgent) -> None:
         # 2. heartbeat + 이벤트 수신을 동시에 실행
         await asyncio.gather(
             _heartbeat(ws, heartbeat_interval),
-            _receive(ws, session, agent),
+            _receive(ws, session, agent, conversation_log),
         )
 
 
@@ -197,14 +291,15 @@ async def _heartbeat(ws, interval: float) -> None:
         await ws.send(json.dumps({"op": OP_HEARTBEAT}))
 
 
-async def _receive(ws, session: Session, agent: ClaudeAgent) -> None:
+async def _receive(ws, session: Session, agent: ClaudeAgent,
+                   conversation_log: ConversationLog) -> None:
     async for raw in ws:
         payload = json.loads(raw)
         if payload.get("s") is not None:
             session.last_seq = payload["s"]
         if payload.get("op") == OP_DISPATCH and payload.get("t") == "MESSAGE_CREATE":
             # Claude 응답을 기다리는 동안에도 다음 이벤트를 계속 받도록 메시지마다 Task로 분리
-            task = asyncio.create_task(on_message(payload["d"], agent))
+            task = asyncio.create_task(on_message(payload["d"], agent, conversation_log))
             _inflight.add(task)
             task.add_done_callback(_inflight.discard)
 
@@ -218,10 +313,10 @@ def _should_resume(code: int | None) -> bool:
     return True
 
 
-async def run(session: Session, agent: ClaudeAgent) -> None:
+async def run(session: Session, agent: ClaudeAgent, conversation_log: ConversationLog) -> None:
     while True:
         try:
-            await gateway_loop(session, agent)
+            await gateway_loop(session, agent, conversation_log)
         except ConnectionClosed as e:
             code = e.rcvd.code if e.rcvd else None
             reason = e.rcvd.reason if e.rcvd else ""
@@ -249,9 +344,13 @@ async def main():
     # Claude 클라이언트는 앱 수명 동안 하나만 두고, 종료할 때 연결을 닫음
     async with AsyncAnthropic(timeout=CLAUDE_TIMEOUT_SEC, max_retries=CLAUDE_MAX_RETRIES) as client:
         agent = ClaudeAgent(client, system_prompt, fallback_reply, MAX_CONCURRENT_REPLIES)
-        log.info("bot starting — gateway=%s, model=%s, effort=%s",
-                 KAKAO_GW_URL, CLAUDE_MODEL, CLAUDE_EFFORT)
-        await run(Session(), agent)
+        conversation_log = ConversationLog(CONVERSATION_DB_PATH)
+        log.info("bot starting — gateway=%s, model=%s, effort=%s, db=%s",
+                 KAKAO_GW_URL, CLAUDE_MODEL, CLAUDE_EFFORT, CONVERSATION_DB_PATH)
+        try:
+            await run(Session(), agent, conversation_log)
+        finally:
+            conversation_log.close()
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ WORKDIR /app
 COPY --from=requirements-stage /tmp/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --no-deps -r /app/requirements.txt
 RUN groupadd -r bot && useradd --no-log-init -r -g bot bot
+# 볼륨 최초 생성 시 이 디렉터리 내용이 볼륨으로 복사됨 → 컨테이너 사용자가 대화 기록을 쓸 수 있게 미리 만들어 둠
+RUN mkdir -p /app/data && chown bot:bot /app/data
 
 FROM base-stage AS develop-stage
 COPY --from=requirements-stage /tmp/requirements-test.txt /app/requirements-test.txt

@@ -9,3 +9,9 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    # 심사관 대화 기록 보관. 재빌드·재시작에도 유지됨 (down -v, system prune --volumes 금지)
+    volumes:
+      - conversation-logs:/app/data
+
+volumes:
+  conversation-logs:

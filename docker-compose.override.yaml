@@ -13,6 +13,7 @@ services:
             - .pytest_cache/
             - __pycache__/
             - .venv/
+            - data/
         - action: rebuild
           path: poetry.lock
 
@@ -31,5 +32,6 @@ services:
             - .pytest_cache/
             - __pycache__/
             - .venv/
+            - data/
         - action: rebuild
           path: poetry.lock

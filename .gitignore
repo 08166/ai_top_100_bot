@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 대화 기록 (심사관 메시지 포함, 외부 공유 금지)
+data/
