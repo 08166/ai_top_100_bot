@@ -122,28 +122,27 @@ poetry add --group test {패키지}     # 테스트 전용 의존성
 
 ## 배포
 
-1. 서버 아키텍처 확인
+레지스트리에 이미지를 올리지 않고, 서버에서 저장소를 받아 직접 빌드한다.
+서버 아키텍처에 맞춰 네이티브로 빌드되기 때문에 이미지 태그나 `platform`을 따로 지정하지 않는다.
+
+1. 최초 1회: 저장소 복제 + `.env` 생성
    ```sh
-   uname -m      # x86_64 → linux/amd64, aarch64 → compose.production.yaml의 platform을 linux/arm64로 변경
+   git clone {저장소 주소} ~/symposium/ai_top_100_bot
+   cd ~/symposium/ai_top_100_bot
+   # .env는 git에 올리지 않으므로 서버에 직접 만들거나 scp로 복사
+   chmod 600 .env
    ```
-1. 배포 이미지 빌드 (로컬)
+1. 배포 (코드 변경 시마다)
    ```sh
-   export BOT_IMAGE_TAG=0.1.0
-   docker compose -f docker-compose.yaml -f docker-compose.production.yaml build
-   ```
-   - `BOT_IMAGE_TAG`가 없으면 compose가 바로 실패함. 태그 없이 배포되는 실수를 막기 위해서다
-1. 이미지와 설정 파일 전송
-   ```sh
-   docker save kakao-bot:$BOT_IMAGE_TAG | gzip | ssh {user}@{host} docker load
-   ssh {user}@{host} 'mkdir -p ~/kakao-bot'
-   scp docker-compose.yaml docker-compose.production.yaml .env {user}@{host}:~/kakao-bot/
-   ```
-1. 서버에서 실행
-   ```sh
-   cd ~/kakao-bot && chmod 600 .env
-   BOT_IMAGE_TAG=0.1.0 docker compose -f docker-compose.yaml -f docker-compose.production.yaml up -d --no-build
+   cd ~/symposium/ai_top_100_bot
+   git pull
+   docker compose -f docker-compose.yaml -f docker-compose.production.yaml up -d --build
    docker compose -f docker-compose.yaml -f docker-compose.production.yaml logs -f bot
    ```
+   - 로그에 `READY — bot id=...`가 찍히면 게이트웨이 연결 성공
+   - 로컬에서 같은 토큰으로 봇을 띄워둔 상태면 close 4004로 충돌하니 로컬은 먼저 내림
+
+> :warning: `docker system prune -af --volumes`는 배포 명령에 붙여 쓰지 않는다. 실행 중이 아닌 모든 컨테이너·이미지·볼륨을 지워서, 서버의 다른 서비스 데이터까지 날아갈 수 있고 빌드 캐시도 매번 사라진다. 디스크 정리가 필요하면 `docker image prune -f` 정도로 범위를 좁힌다.
 
 배포 설정에서 정해둔 것:
 
