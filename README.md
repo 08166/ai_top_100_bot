@@ -1,84 +1,164 @@
-# 몽타주 시뮬레이터 — AI_TOP_100 [2025] 본선 2번 재현
+# AI_TOP_100
 
-작년 본선 문제 **"몽타주를 그려라"**를 로컬에서 그대로 연습하기 위한 채점 서버입니다.
-실제 대회 API와 정답 얼굴은 공개되지 않아, 같은 규칙으로 동작하는 "AI 목격자 카오"를 재구성했습니다.
+> AI_TOP_100 [2026] 대회용 카카오톡 봇<br/>
+> 교동마을(농산물)·갯마을(수산물) 조합 업무를 돕는 AI 에이전트를 카카오톡에서 응답하도록 붙이는 프로젝트<br/>
+> pep8 스타일 가이드에 따름 ([PEP8 Style Guide](https://peps.python.org/pep-0008/))
 
-## 원래 문제 규칙 → 이 시뮬레이터
+## 사용 목적
 
-| 원래 규칙 | 구현 |
+대회에서는 마을 관계자 인터뷰 → 데이터 수집·검증·정제 → 조합 업무를 개선하는 AI 에이전트 제출 순서로 진행된다.
+이 저장소는 그중 **에이전트가 카카오톡으로 요청을 받고 응답을 돌려주는 통로**를 맡는다.
+
+- 지금은 받은 메시지를 그대로 돌려주는 에코 봇까지 구현됨 (`bot-test.py`)
+- 에이전트 로직은 `on_message` 자리에 붙일 예정. 제출 형태와 심사 방식은 아직 확정 안됨
+- 대회 일정·출제 패턴·작업 지침은 [00.context_guidelines.md](./00.context_guidelines.md) 참고
+
+## 사용된 것 <sub><small>(Built With)</small></sub>
+
+> Python 3.14 기반이고, 봇 게이트웨이와는 WebSocket, 응답 전송은 HTTP로 통신한다.
+
+- 런타임
+  - Python 3.14
+- 라이브러리
+  - [websockets](https://websockets.readthedocs.io/en/stable/) — 봇 게이트웨이 WebSocket 연결 (HELLO → IDENTIFY/RESUME → heartbeat → 이벤트 수신)
+  - [HTTPX](https://www.python-httpx.org/) — `/v1/bot/callback`으로 응답 전송
+  - [python-dotenv](https://github.com/theskumar/python-dotenv) — 로컬 실행 시 `.env`의 `BOT_TOKEN` 로딩
+- 테스트
+  - [pytest](https://docs.pytest.org/en/stable/)
+  - [pytest-watcher](https://github.com/olzhasar/pytest-watcher) — 파일이 바뀔 때마다 pytest 자동 재실행
+- 패키지 의존성 관리
+  - [poetry](https://python-poetry.org/docs/) (2.5.1)
+- 실행 환경
+  - Docker, Docker Compose ([Compose Watch](https://docs.docker.com/compose/how-tos/file-watch/)로 핫리로딩)
+
+# 시작하기
+
+로컬 개발과 배포 모두 Docker 환경을 기준으로 한다.
+브레이크포인트 디버깅이 필요할 때만 로컬 poetry 환경에서 직접 실행한다.
+
+## 사전 준비
+
+- Docker, Docker Compose
+  - Compose Watch의 `sync+restart`를 쓰기 때문에 Compose 2.23.0 이상 필요
+- poetry: python 패키지 의존성 관리 도구 [python-poetry](https://python-poetry.org/)
+  - 의존성을 추가하거나 로컬에서 디버깅할 때만 설치해도 무방
+- 카카오 계정 + 카카오톡 연동, 봇 토큰 (`BOT_TOKEN`)
+
+## 설치 / 설정 <sub><small>(Installation / Setup)</small></sub>
+
+1. 프로젝트 루트에 `.env` 생성
+   ```sh
+   BOT_TOKEN=발급받은_봇_토큰
+   ```
+   - `.env`는 `.dockerignore`로 이미지에서 빠지고, 실행할 때 compose의 `env_file`로 주입됨
+   - 토큰은 커밋하지 않음
+
+## 파일 구성
+
+| 파일 | 역할 |
 |---|---|
-| 텍스트 목격 진술 제공 | 정답 얼굴의 특징값으로 진술 자동 생성 (`case/statement.txt`) |
-| 제출 이미지에 유사도 + 부위별 피드백 | 전체 유사도(0~100) + 눈·눈썹·코·입·얼굴형·나이·성별 점수 |
-| 1분당 1회 제출 | `--cooldown 60` (기본값) |
-| 1024×1024, PNG/JPEG, 10MB 이하 | 서버에서 엄격히 검사, 위반 시 거부 |
-| 동일 이미지(파일 해시) 재제출 무효 | sha256 비교, 평가 안 함 (쿨다운도 소모 안 함) |
-| 이력은 최근 4건, 각 이력에 최고 유사도 표시 | `/history` 동일 |
-| 최고 유사도 1장으로 최종 평가 | `reveal.py`에서 최고점 기준 |
+| `bot-test.py` | 게이트웨이 연결, heartbeat, `MESSAGE_CREATE` 수신 → callback 응답 |
+| `Dockerfile` | `requirements-stage` → `base-stage` → `develop-stage` / `production-stage` |
+| `compose.yaml` | 로컬·배포 공통 설정 (build context, init, env_file) |
+| `compose.override.yaml` | 로컬 개발용. `docker compose up` 하면 자동으로 같이 읽힘 |
+| `compose.production.yaml` | 배포용. `-f`로 직접 지정해야 읽힘 |
+| `00.context_guidelines.md` | 대회 정보와 작업 지침 |
 
-### 채점 방식 (원래 대회의 내부 방식은 비공개라 추정해서 설계)
-- **전체 인상(identity)**: ArcFace 얼굴 인식 임베딩의 코사인 유사도
-- **부위별 점수**: 68개 얼굴 랜드마크로 측정한 비율(눈 크기, 미간, 코 길이·폭, 입 너비, 입술 두께, 얼굴 비율, 턱 등)을 정답과 비교. 차이는 얼굴 풀의 표준편차로 정규화
-- **유사도 = 0.5 × identity + 0.5 × 부위 가중평균**, 성별이 다르면 ×0.6
-- 그래서 부위 비율만 맞춰서는 절반까지만 오르고, **전체 인상까지 비슷해야** 고득점이 나옵니다
+Dockerfile 스테이지를 나눈 이유는 테스트 의존성 때문이다.
+`develop-stage`와 `production-stage`가 둘 다 `base-stage`를 상속해서, pytest는 개발 이미지에만 들어가고 운영 이미지에는 들어가지 않는다.
 
-## 설치 (macOS, Apple Silicon 기준)
+## 로컬 개발 실행
 
-```bash
-cd montage-sim
-python3.11 -m venv .venv && source .venv/bin/activate   # 3.10~3.13 가능
-pip install -r requirements.txt
+1. 봇 + 테스트 감시 실행
+   ```sh
+   docker compose up --build --watch
+   ```
+   - `bot`: 코드를 저장하면 컨테이너로 복사한 뒤 봇을 재시작함 (`sync+restart`)
+   - `test`: 코드를 복사만 하고, 컨테이너 안의 `ptw`가 변경을 감지해서 pytest를 다시 돌림 (`sync`)
+   - `poetry.lock`이 바뀌면 이미지를 다시 빌드함 (`rebuild`)
+1. 정상 동작 확인
+   - `bot` 로그에 `READY — bot id=...`가 찍히면 게이트웨이 연결 성공
+   - 카카오톡으로 메시지를 보내면 `echo: {메시지}`가 돌아옴
+   - `test` 로그에 pytest 결과가 나옴. 테스트 파일이 없으면 exit code 5(no tests collected)인데 이건 정상
+1. 로그를 동기화 이벤트와 분리해서 보고 싶을 때
+   ```sh
+   docker compose watch
+   docker compose logs -f bot
+   ```
+
+> :warning: `test` 서비스에는 `.env`를 주입하지 않는다. 테스트가 실제 카카오 게이트웨이를 호출하지 못하게 막기 위해서다.
+
+## 브레이크포인트 디버깅
+
+watch 모드에서는 저장할 때마다 봇 프로세스가 재시작돼서 디버거 연결이 끊긴다.
+그래서 브레이크포인트가 필요할 때는 봇만 로컬에서 직접 띄운다.
+
+1. 컨테이너 봇 정지 (테스트 감시는 계속 돌려도 됨)
+   ```sh
+   docker compose stop bot
+   ```
+   > :warning: 같은 토큰으로 두 군데서 연결하면 먼저 붙은 쪽이 close 4004(replaced)로 끊기고, 코드상 재연결하지 않고 종료된다.
+1. 로컬 가상환경에 의존성 설치 후 실행
+   ```sh
+   poetry install
+   poetry run python bot-test.py
+   ```
+   - IDE에서는 `.venv`를 인터프리터로 잡고 `bot-test.py`를 디버그 실행
+   - `.env`는 `load_dotenv()`가 읽음. 이미 설정된 환경변수는 덮어쓰지 않음
+1. 디버깅이 끝나면 컨테이너 봇 다시 시작
+   ```sh
+   docker compose start bot
+   ```
+
+## 의존성 추가
+
+```sh
+poetry add {패키지}                  # 런타임 의존성 (main)
+poetry add --group test {패키지}     # 테스트 전용 의존성
 ```
-- `insightface` 설치 중 컴파일 오류가 나면 `xcode-select --install`로 Command Line Tools를 깔고 다시 시도하세요.
-- 첫 실행 때 얼굴 모델(buffalo_l, 약 280MB)을 GitHub에서 자동으로 받습니다 (`~/.insightface/`).
 
-## 사용법
+- 빌드할 때 `poetry export`로 `requirements.txt`를 만들고, 해시 검사 모드로 설치함 (`--without-hashes`를 쓰지 않는 이유)
+- watch 실행 중이면 `poetry.lock` 변경을 감지해서 이미지를 자동으로 다시 빌드함
 
-### 1. 사건 만들기 (정답 얼굴을 몰래 정함)
-```bash
-python setup_case.py            # thispersondoesnotexist.com 에서 가상 인물 20장 자동 수집 → 1장을 랜덤으로 정답 지정
-```
-- 수집한 얼굴은 화면에 띄우지 않고, 정답 1장만 `case/.answer/`에 남기고 나머지는 삭제합니다.
-- 사이트가 막혀 있으면 `python setup_case.py --source dir --dir <폴더>` (본인이 보지 않은 사진이어야 연습이 됩니다. 다른 사람에게 폴더를 채워 달라고 부탁하는 게 가장 좋아요).
-- 새 사건: `python setup_case.py --force`
+## 배포
 
-> ⚠ **`case/case.json`과 `case/.answer/`는 연습이 끝날 때까지 열지 마세요.** 정답 특징값이 그대로 들어 있습니다.
+1. 서버 아키텍처 확인
+   ```sh
+   uname -m      # x86_64 → linux/amd64, aarch64 → compose.production.yaml의 platform을 linux/arm64로 변경
+   ```
+1. 배포 이미지 빌드 (로컬)
+   ```sh
+   export BOT_IMAGE_TAG=0.1.0
+   docker compose -f compose.yaml -f compose.production.yaml build
+   ```
+   - `BOT_IMAGE_TAG`가 없으면 compose가 바로 실패함. 태그 없이 배포되는 실수를 막기 위해서다
+1. 이미지와 설정 파일 전송
+   ```sh
+   docker save kakao-bot:$BOT_IMAGE_TAG | gzip | ssh {user}@{host} docker load
+   ssh {user}@{host} 'mkdir -p ~/kakao-bot'
+   scp compose.yaml compose.production.yaml .env {user}@{host}:~/kakao-bot/
+   ```
+1. 서버에서 실행
+   ```sh
+   cd ~/kakao-bot && chmod 600 .env
+   BOT_IMAGE_TAG=0.1.0 docker compose -f compose.yaml -f compose.production.yaml up -d --no-build
+   docker compose -f compose.yaml -f compose.production.yaml logs -f bot
+   ```
 
-### 2. 서버 실행
-```bash
-python server.py                     # 대회와 동일: 60초 쿨다운, 힌트 레벨 1
-python server.py --time-limit 60     # 첫 제출부터 60분 제한 (실전 감각)
-python server.py --hint 0            # 점수만 (가장 어려움)
-python server.py --hint 2            # "코를 더 짧게" 같은 방향까지 (입문용)
-```
+배포 설정에서 정해둔 것:
 
-### 3. 몽타주 생성 → 제출
-이미지는 원하는 AI 도구(ChatGPT, Gemini, Midjourney, Stable Diffusion 등)로 만듭니다.
-```bash
-python submit.py montage_01.png          # 제출
-python submit.py montage_01.webp --fix   # 1024x1024 PNG로 변환해서 제출
-python submit.py --history               # 최근 4건 + 최고 유사도
-python submit.py --status                # 다음 제출까지 남은 시간
-python submit.py --statement             # 진술 다시 보기
-```
-curl로 직접 호출해도 됩니다:
-```bash
-curl -F "file=@montage_01.png" http://127.0.0.1:8000/submit
-```
+- `restart: on-failure:3` — 네트워크 끊김은 코드 안에서 재연결함. 프로세스가 죽는 건 인증 실패(4001)·중복 연결(4004) 같은 치명 오류라서 무한 재시작하지 않게 3회로 제한
+- `init: true` — `docker stop`의 SIGTERM이 python 프로세스까지 전달되게 함
+- 로그는 `json-file` 10MB × 3개로 순환. 메시지마다 INFO 로그가 쌓여서 디스크가 차는 걸 막기 위해서다
 
-### 4. 정답 공개 & 회고
-```bash
-python reveal.py     # 정답 vs 최고점 몽타주를 case/reveal.png 로 나란히 저장 + 전체 점수 추이 출력
-```
-모든 제출 이미지는 `case/submissions/`에, 기록은 `case/submissions.jsonl`에 남습니다.
+## 게이트웨이 close code 처리
 
-## 연습할 때 볼 포인트 (출제 의도)
-1. **진술 → 프롬프트 설계**: 모호한 묘사를 생성 모델이 이해하는 구체적 지시로 바꾸는 능력
-2. **피드백 해석**: 부위별 점수가 무엇을 뜻하는지 가설을 세우고 한 번에 한두 변수만 바꾸기
-3. **쿨다운 안에서의 전략**: 1분 1회라서 무작위 반복보다 실험 설계가 중요
-4. **일관성 유지**: 좋아진 요소를 잃지 않도록 같은 인물을 유지한 채 부분 수정 (seed 고정, 이미지 편집/inpainting, 참조 이미지 활용 등)
-5. **자동화 판단**: 생성 API가 있다면 생성 → 제출 → 피드백 반영을 스크립트로 묶을지 결정
+| code | 의미 | 동작 |
+|---|---|---|
+| 1001 | 서버 재시작 | RESUME으로 세션 복구 |
+| 4001 | 토큰 오류 | 종료 (`.env`의 `BOT_TOKEN` 확인) |
+| 4003 | 잘못된 payload | 종료 (프로토콜 버그) |
+| 4004 | 중복 연결로 대체됨 | 종료 (같은 토큰으로 다른 곳에서 실행 중인지 확인) |
+| 4009 | 세션 만료 | 세션 초기화 후 새로 IDENTIFY |
 
-## 한계
-- 실제 대회의 정답 얼굴, 채점 모델, 가중치와는 다릅니다. 피드백 루프 연습용입니다.
-- 진술은 자동 생성이라 실제 목격자 진술보다 단서가 정형화돼 있습니다.
-- 나이·성별은 모델 추정치라 몇 살 오차가 있습니다.
+> 게이트웨이 프로토콜은 공개 문서를 찾지 못해서 `bot-test.py`에 구현된 내용을 기준으로 정리함. 대회 안내 자료와 다르면 그쪽을 따름 (확인 필요)
