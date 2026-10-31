@@ -5,3 +5,6 @@ services:
     init: true
     env_file:
       - .env
+    volumes:
+      # 대회 자료는 이미지·git에 넣지 않고 호스트에서 읽기 전용으로 붙임
+      - ./knowledge:/app/knowledge:ro

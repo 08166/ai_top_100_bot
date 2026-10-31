@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -6,8 +7,9 @@ import re
 import sqlite3
 import sys
 import time
+import weakref
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import anthropic
@@ -36,6 +38,12 @@ MAX_CONCURRENT_REPLIES = int(os.getenv("MAX_CONCURRENT_REPLIES", "4"))
 SYSTEM_PROMPT_PATH = BASE_DIR / os.getenv("SYSTEM_PROMPT_PATH", "prompts/system.txt")
 FALLBACK_REPLY_PATH = BASE_DIR / os.getenv("FALLBACK_REPLY_PATH", "prompts/fallback.txt")
 CONVERSATION_DB_PATH = BASE_DIR / os.getenv("CONVERSATION_DB_PATH", "data/conversations.db")
+# 대회 자료는 git에 올리지 않으므로 프롬프트와 분리해 실행 시 읽음 (운영은 read-only 마운트)
+KNOWLEDGE_DIR = BASE_DIR / os.getenv("KNOWLEDGE_DIR", "knowledge")
+KNOWLEDGE_GLOB = os.getenv("KNOWLEDGE_GLOB", "0[0-8]_*.md")
+# 멀티턴: 같은 사용자의 최근 대화만 이어 붙임. 오래된 대화까지 넣으면 입력이 커져 응답이 느려짐
+HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "6"))
+HISTORY_WINDOW_MIN = int(os.getenv("HISTORY_WINDOW_MIN", "30"))
 
 KAKAO_GW_URL = "wss://bot-gateway.kakao.com/gateway"
 KAKAO_API_URL = "https://kapi.kakao.com"
@@ -63,6 +71,8 @@ RECONNECT_BACKOFF_SEC = 3.0
 
 # 이벤트 루프는 Task를 약한 참조로만 들고 있어서, 끝나기 전에 GC되지 않게 여기서 참조를 유지
 _inflight: set[asyncio.Task] = set()
+# 대화방별 순서 보장용 Lock. 처리 중인 Task가 없으면 참조가 사라져 자동으로 정리됨
+_conversation_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = weakref.WeakValueDictionary()
 
 
 # ── 대화 기록 ────────────────────────────────────────────────────────
@@ -92,9 +102,12 @@ class ConversationLog:
             request_id      TEXT,
             input_tokens    INTEGER,
             output_tokens   INTEGER,
-            callback_status INTEGER
+            callback_status INTEGER,
+            conversation_key TEXT
         )
     """
+    # 멀티턴 문맥으로 다시 쓸 수 있는 답만 고름. 오류 안내 문구는 문맥이 아님
+    CONTEXT_OUTCOMES = ("ok", "truncated")
 
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,22 +119,44 @@ class ConversationLog:
         self.conn.execute("PRAGMA busy_timeout=5000")
         with self.conn:
             self.conn.execute(self.SCHEMA)
+            # 예선 운영 DB는 conversation_key 없이 만들어졌으므로 기존 행을 지우지 않고 열만 추가
+            columns = {row[1] for row in self.conn.execute("PRAGMA table_info(conversations)")}
+            if "conversation_key" not in columns:
+                self.conn.execute("ALTER TABLE conversations ADD COLUMN conversation_key TEXT")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversations_key"
+                " ON conversations (conversation_key, received_at)"
+            )
 
     def record(self, entry: dict) -> None:
         with self.conn:
             self.conn.execute(
                 """INSERT INTO conversations (
                        received_at, content, event_json, reply, outcome, latency_ms,
-                       model, request_id, input_tokens, output_tokens, callback_status
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       model, request_id, input_tokens, output_tokens, callback_status,
+                       conversation_key
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     entry["received_at"], entry["content"],
                     json.dumps(entry["event"], ensure_ascii=False, default=str),
                     entry["reply"], entry["outcome"], entry["latency_ms"],
                     entry["model"], entry["request_id"],
                     entry["input_tokens"], entry["output_tokens"], entry["callback_status"],
+                    entry["conversation_key"],
                 ),
             )
+
+    def recent_turns(self, conversation_key: str, since: str, limit: int) -> list[tuple[str, str]]:
+        """since(ISO UTC) 이후 같은 대화방의 (질문, 답) 쌍을 오래된 순으로 최대 limit개 돌려준다."""
+        placeholders = ", ".join("?" for _ in self.CONTEXT_OUTCOMES)
+        rows = self.conn.execute(
+            f"""SELECT content, reply FROM conversations
+                WHERE conversation_key = ? AND received_at >= ?
+                  AND outcome IN ({placeholders}) AND content <> ''
+                ORDER BY id DESC LIMIT ?""",
+            (conversation_key, since, *self.CONTEXT_OUTCOMES, limit),
+        ).fetchall()
+        return list(reversed(rows))
 
     def close(self) -> None:
         self.conn.close()
@@ -139,7 +174,16 @@ class ClaudeAgent:
         # 동시에 몰려도 Claude 호출 수를 제한해서 rate limit과 비용 폭주를 막음
         self.limiter = asyncio.Semaphore(max_concurrent)
 
-    async def reply(self, user_text: str) -> AgentReply:
+    async def reply(self, user_text: str,
+                    history: list[tuple[str, str]] | None = None) -> AgentReply:
+        # Messages API는 user/assistant가 번갈아 와야 하므로 (질문, 답) 쌍을 순서대로 펼침
+        messages = [
+            message
+            for question, answer in history or []
+            for message in ({"role": "user", "content": question},
+                            {"role": "assistant", "content": answer})
+        ]
+        messages.append({"role": "user", "content": user_text})
         try:
             async with self.limiter:
                 response = await self.client.beta.messages.create(
@@ -148,7 +192,7 @@ class ClaudeAgent:
                     # 지식이 담긴 긴 시스템 프롬프트를 캐시해서 응답 지연(p95)을 줄임
                     system=[{"type": "text", "text": self.system_prompt,
                              "cache_control": {"type": "ephemeral"}}],
-                    messages=[{"role": "user", "content": user_text}],
+                    messages=messages,
                     output_config={"effort": CLAUDE_EFFORT},
                     # 안전 분류기가 거절하면 서버가 대체 모델로 다시 시도
                     betas=["server-side-fallback-2026-07-01"],
@@ -191,6 +235,17 @@ def sanitize_reply(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
+def build_system_prompt(instructions: str, knowledge_files: list[Path]) -> str:
+    """응대 규칙 뒤에 지식 파일을 '=== 파일명 ===' 구획으로 이어 붙인다."""
+    sections = [f"=== {path.stem} ===\n{path.read_text(encoding='utf-8')}" for path in knowledge_files]
+    return "\n\n".join([instructions.rstrip(), *sections])
+
+
+def conversation_key(d: dict) -> str | None:
+    # 1:1 채널은 botUserKey, 그룹방은 botGroupKey로 사람(방)을 구분
+    return d.get("botUserKey") or d.get("botGroupKey") or None
+
+
 # ── 메시지 처리 ──────────────────────────────────────────────────────
 async def on_message(d: dict, agent: ClaudeAgent, conversation_log: ConversationLog) -> None:
     """MESSAGE_CREATE 이벤트를 받아 Claude 답변을 callback으로 돌려주고 대화를 기록한다."""
@@ -204,32 +259,46 @@ async def on_message(d: dict, agent: ClaudeAgent, conversation_log: Conversation
         log.error("callbackToken 누락 — skip")
         return
 
-    reply = await agent.reply(content)
-    callback_status: int | None = None
-    try:
-        callback_status = await send_callback(callback_token, reply.text)
-    except httpx.HTTPError as e:
-        # 별도 Task에서 돌기 때문에 여기서 잡지 않으면 예외가 로그 없이 사라짐
-        log.error("callback request failed — %s", e)
+    key = conversation_key(d)
+    # 같은 고객이 연달아 보내면 앞 답이 기록된 뒤에 처리해야 다음 질문이 그 답을 문맥으로 봄
+    lock = _conversation_locks.setdefault(key, asyncio.Lock()) if key else contextlib.nullcontext()
+    async with lock:
+        history: list[tuple[str, str]] = []
+        if key:
+            since = (received_at - timedelta(minutes=HISTORY_WINDOW_MIN)).isoformat()
+            try:
+                history = conversation_log.recent_turns(key, since, HISTORY_MAX_TURNS)
+            except sqlite3.Error as e:
+                # 문맥 조회가 실패해도 단발 답변은 보내야 하므로 빈 문맥으로 진행
+                log.error("conversation history read failed — %s", e)
 
-    try:
-        conversation_log.record({
-            "received_at": received_at.isoformat(),
-            "content": content,
-            # callbackToken은 1회용 자격증명이라 남기지 않음
-            "event": {k: v for k, v in d.items() if k != "callbackToken"},
-            "reply": reply.text,
-            "outcome": reply.outcome,
-            "latency_ms": round((time.monotonic() - started) * 1000),
-            "model": CLAUDE_MODEL,
-            "request_id": reply.request_id,
-            "input_tokens": reply.input_tokens,
-            "output_tokens": reply.output_tokens,
-            "callback_status": callback_status,
-        })
-    except sqlite3.Error as e:
-        # 기록 실패가 답장 흐름을 막지 않게 로그만 남김
-        log.error("conversation log write failed — %s", e)
+        reply = await agent.reply(content, history)
+        callback_status: int | None = None
+        try:
+            callback_status = await send_callback(callback_token, reply.text)
+        except httpx.HTTPError as e:
+            # 별도 Task에서 돌기 때문에 여기서 잡지 않으면 예외가 로그 없이 사라짐
+            log.error("callback request failed — %s", e)
+
+        try:
+            conversation_log.record({
+                "received_at": received_at.isoformat(),
+                "content": content,
+                # callbackToken은 1회용 자격증명이라 남기지 않음
+                "event": {k: v for k, v in d.items() if k != "callbackToken"},
+                "reply": reply.text,
+                "outcome": reply.outcome,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+                "model": CLAUDE_MODEL,
+                "request_id": reply.request_id,
+                "input_tokens": reply.input_tokens,
+                "output_tokens": reply.output_tokens,
+                "callback_status": callback_status,
+                "conversation_key": key,
+            })
+        except sqlite3.Error as e:
+            # 기록 실패가 답장 흐름을 막지 않게 로그만 남김
+            log.error("conversation log write failed — %s", e)
 
 
 # ── 봇 callback ──────────────────────────────────────────
@@ -361,15 +430,20 @@ async def main():
         log.error("ANTHROPIC_API_KEY 환경변수를 설정하세요")
         sys.exit(1)
 
-    system_prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+    knowledge_files = sorted(KNOWLEDGE_DIR.glob(KNOWLEDGE_GLOB))
+    if not knowledge_files:
+        # 지식 없이 뜨면 근거 없는 답만 하게 되므로 시작 단계에서 멈춤
+        log.error("지식 파일이 없습니다 — %s/%s", KNOWLEDGE_DIR, KNOWLEDGE_GLOB)
+        sys.exit(1)
+    system_prompt = build_system_prompt(SYSTEM_PROMPT_PATH.read_text(encoding="utf-8"), knowledge_files)
     fallback_reply = FALLBACK_REPLY_PATH.read_text(encoding="utf-8").strip()
 
     # Claude 클라이언트는 앱 수명 동안 하나만 두고, 종료할 때 연결을 닫음
     async with AsyncAnthropic(timeout=CLAUDE_TIMEOUT_SEC, max_retries=CLAUDE_MAX_RETRIES) as client:
         agent = ClaudeAgent(client, system_prompt, fallback_reply, MAX_CONCURRENT_REPLIES)
         conversation_log = ConversationLog(CONVERSATION_DB_PATH)
-        log.info("bot starting — gateway=%s, model=%s, effort=%s, db=%s",
-                 KAKAO_GW_URL, CLAUDE_MODEL, CLAUDE_EFFORT, CONVERSATION_DB_PATH)
+        log.info("bot starting — gateway=%s, model=%s, effort=%s, db=%s, knowledge=%d files",
+                 KAKAO_GW_URL, CLAUDE_MODEL, CLAUDE_EFFORT, CONVERSATION_DB_PATH, len(knowledge_files))
         try:
             await run(Session(), agent, conversation_log)
         finally:

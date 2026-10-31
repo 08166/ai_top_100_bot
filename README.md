@@ -132,6 +132,12 @@ poetry add --group test {패키지}     # 테스트 전용 의존성
    # .env는 git에 올리지 않으므로 서버에 직접 만들거나 scp로 복사
    chmod 600 .env
    ```
+1. 지식 파일 전달: 대회 자료(`knowledge/`)는 git에 올리지 않고 scp로 보낸다. 컨테이너에 읽기 전용으로 마운트되며, 컨테이너 사용자(`bot`)가 읽을 수 있게 `644`로 둔다
+   ```sh
+   scp knowledge/0*.md {서버}:~/symposium/ai_top_100_bot/knowledge/
+   ssh {서버} 'chmod 644 ~/symposium/ai_top_100_bot/knowledge/*.md'
+   ```
+   - 시스템 프롬프트에는 `KNOWLEDGE_GLOB`(기본 `0[0-8]_*.md`)에 맞는 파일만 들어감. 파일이 하나도 없으면 봇이 시작하지 않음
 1. 배포 (코드 변경 시마다)
    ```sh
    cd ~/symposium/ai_top_100_bot
@@ -146,7 +152,7 @@ poetry add --group test {패키지}     # 테스트 전용 의존성
 
 ## 대화 기록
 
-메시지 한 건마다 받은 메시지, 이벤트 원본(`callbackToken` 제외, `event_json`), 봇 답변, 처리 결과(`ok`/`fallback`/`refusal`/`error`), 응답 시간, Claude `request_id`·토큰 수, callback 응답 코드를 SQLite `/app/data/conversations.db`의 `conversations` 테이블에 한 행씩 저장한다.
+메시지 한 건마다 받은 메시지, 이벤트 원본(`callbackToken` 제외, `event_json`), 봇 답변, 처리 결과(`ok`/`truncated`/`fallback`/`refusal`/`blocked`/`error`), 응답 시간, Claude `request_id`·토큰 수, callback 응답 코드, 대화방 키(`conversation_key` = `botUserKey` 또는 `botGroupKey`)를 SQLite `/app/data/conversations.db`의 `conversations` 테이블에 한 행씩 저장한다.
 WAL 모드라서 봇이 기록하는 중에도 읽을 수 있다. 배포 환경에서는 named volume `conversation-logs`에 저장돼서 재빌드·재시작해도 유지된다. 심사관 메시지가 담기므로 DB 파일은 `0600`으로 만들고 git·이미지에서 제외한다(`data/`). 외부 공유 금지.
 
 ```sh
