@@ -86,6 +86,9 @@ class AgentReply:
     request_id: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # 캐시 적중 확인용. 적중하면 input_tokens에는 캐시 지점 뒤(대화 이력·질문)만 잡힘
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
 
 
 class ConversationLog:
@@ -104,10 +107,15 @@ class ConversationLog:
             request_id      TEXT,
             input_tokens    INTEGER,
             output_tokens   INTEGER,
-            callback_status INTEGER,
-            conversation_key TEXT
+            callback_status INTEGER
         )
     """
+    # 예선 운영 DB는 SCHEMA 열만으로 만들어졌으므로 이후에 늘어난 열은 기존 행을 지우지 않고 ALTER로 붙임
+    ADDED_COLUMNS = {
+        "conversation_key": "TEXT",
+        "cache_read_input_tokens": "INTEGER",
+        "cache_creation_input_tokens": "INTEGER",
+    }
     # 멀티턴 문맥으로 다시 쓸 수 있는 답만 고름. 오류 안내 문구는 문맥이 아님
     CONTEXT_OUTCOMES = ("ok", "truncated")
 
@@ -121,10 +129,10 @@ class ConversationLog:
         self.conn.execute("PRAGMA busy_timeout=5000")
         with self.conn:
             self.conn.execute(self.SCHEMA)
-            # 예선 운영 DB는 conversation_key 없이 만들어졌으므로 기존 행을 지우지 않고 열만 추가
             columns = {row[1] for row in self.conn.execute("PRAGMA table_info(conversations)")}
-            if "conversation_key" not in columns:
-                self.conn.execute("ALTER TABLE conversations ADD COLUMN conversation_key TEXT")
+            for name, column_type in self.ADDED_COLUMNS.items():
+                if name not in columns:
+                    self.conn.execute(f"ALTER TABLE conversations ADD COLUMN {name} {column_type}")
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conversations_key"
                 " ON conversations (conversation_key, received_at)"
@@ -136,8 +144,8 @@ class ConversationLog:
                 """INSERT INTO conversations (
                        received_at, content, event_json, reply, outcome, latency_ms,
                        model, request_id, input_tokens, output_tokens, callback_status,
-                       conversation_key
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       conversation_key, cache_read_input_tokens, cache_creation_input_tokens
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     entry["received_at"], entry["content"],
                     json.dumps(entry["event"], ensure_ascii=False, default=str),
@@ -145,6 +153,7 @@ class ConversationLog:
                     entry["model"], entry["request_id"],
                     entry["input_tokens"], entry["output_tokens"], entry["callback_status"],
                     entry["conversation_key"],
+                    entry["cache_read_input_tokens"], entry["cache_creation_input_tokens"],
                 ),
             )
 
@@ -207,7 +216,10 @@ class ClaudeAgent:
             log.error("claude connection error — %s", e)
             return AgentReply(self.fallback_reply, "error")
 
-        usage = (response._request_id, response.usage.input_tokens, response.usage.output_tokens)
+        usage = (
+            response._request_id, response.usage.input_tokens, response.usage.output_tokens,
+            response.usage.cache_read_input_tokens, response.usage.cache_creation_input_tokens,
+        )
         if response.stop_reason == "refusal":
             log.warning("claude refusal — request_id=%s", response._request_id)
             return AgentReply(self.fallback_reply, "refusal", *usage)
@@ -301,6 +313,8 @@ async def on_message(d: dict, agent: ClaudeAgent, conversation_log: Conversation
                 "request_id": reply.request_id,
                 "input_tokens": reply.input_tokens,
                 "output_tokens": reply.output_tokens,
+                "cache_read_input_tokens": reply.cache_read_input_tokens,
+                "cache_creation_input_tokens": reply.cache_creation_input_tokens,
                 "callback_status": callback_status,
                 "conversation_key": key,
             })

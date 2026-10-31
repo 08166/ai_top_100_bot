@@ -18,7 +18,8 @@ class FakeMessages:
         self.calls.append(kwargs)
         return SimpleNamespace(
             _request_id="req_test",
-            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1,
+                                  cache_read_input_tokens=0, cache_creation_input_tokens=0),
             stop_reason="end_turn",
             content=[SimpleNamespace(type="text", text=self.text)],
         )
@@ -72,7 +73,7 @@ def entry(content: str, key: str | None, received_at: str, outcome: str = "ok") 
         "received_at": received_at, "content": content, "event": {}, "reply": f"답:{content}",
         "outcome": outcome, "latency_ms": 1, "model": "m", "request_id": None,
         "input_tokens": None, "output_tokens": None, "callback_status": 200,
-        "conversation_key": key,
+        "conversation_key": key, "cache_read_input_tokens": None, "cache_creation_input_tokens": None,
     }
 
 
@@ -95,11 +96,11 @@ def test_history_keeps_only_same_customer_recent_answered_turns(conversation_log
     assert turns == [("첫 질문", "답:첫 질문"), ("둘째 질문", "답:둘째 질문")]
 
 
-def test_existing_submission_db_gains_conversation_key_without_losing_rows(bot, tmp_path):
-    # 예선 운영 DB는 conversation_key 열 없이 만들어졌음
+def test_existing_submission_db_gains_new_columns_without_losing_rows(bot, tmp_path):
+    # 예선 운영 DB는 conversation_key·캐시 토큰 열 없이 만들어졌음
     db_path = tmp_path / "conversations.db"
     with sqlite3.connect(db_path) as conn:
-        conn.execute(bot.ConversationLog.SCHEMA.replace(",\n            conversation_key TEXT", ""))
+        conn.execute(bot.ConversationLog.SCHEMA)
         conn.execute("INSERT INTO conversations (received_at, event_json, reply, outcome)"
                      " VALUES ('2037-06-30T00:00:00+00:00', '{}', '답', 'ok')")
 

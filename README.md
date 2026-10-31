@@ -152,7 +152,7 @@ poetry add --group test {패키지}     # 테스트 전용 의존성
 
 ## 대화 기록
 
-메시지 한 건마다 받은 메시지, 이벤트 원본(`callbackToken` 제외, `event_json`), 봇 답변, 처리 결과(`ok`/`truncated`/`fallback`/`refusal`/`blocked`/`error`), 응답 시간, Claude `request_id`·토큰 수, callback 응답 코드, 대화방 키(`conversation_key` = `botUserKey` 또는 `botGroupKey`)를 SQLite `/app/data/conversations.db`의 `conversations` 테이블에 한 행씩 저장한다.
+메시지 한 건마다 받은 메시지, 이벤트 원본(`callbackToken` 제외, `event_json`), 봇 답변, 처리 결과(`ok`/`truncated`/`fallback`/`refusal`/`blocked`/`error`), 응답 시간, Claude `request_id`·토큰 수(캐시에서 읽은 `cache_read_input_tokens`, 캐시에 쓴 `cache_creation_input_tokens` 포함), callback 응답 코드, 대화방 키(`conversation_key` = `botUserKey` 또는 `botGroupKey`)를 SQLite `/app/data/conversations.db`의 `conversations` 테이블에 한 행씩 저장한다.
 WAL 모드라서 봇이 기록하는 중에도 읽을 수 있다. 배포 환경에서는 named volume `conversation-logs`에 저장돼서 재빌드·재시작해도 유지된다. 심사관 메시지가 담기므로 DB 파일은 `0600`으로 만들고 git·이미지에서 제외한다(`data/`). 외부 공유 금지.
 
 ```sh
