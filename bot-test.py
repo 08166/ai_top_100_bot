@@ -40,7 +40,9 @@ FALLBACK_REPLY_PATH = BASE_DIR / os.getenv("FALLBACK_REPLY_PATH", "prompts/fallb
 CONVERSATION_DB_PATH = BASE_DIR / os.getenv("CONVERSATION_DB_PATH", "data/conversations.db")
 # 대회 자료는 git에 올리지 않으므로 프롬프트와 분리해 실행 시 읽음 (운영은 read-only 마운트)
 KNOWLEDGE_DIR = BASE_DIR / os.getenv("KNOWLEDGE_DIR", "knowledge")
-KNOWLEDGE_GLOB = os.getenv("KNOWLEDGE_GLOB", "0[0-8]_*.md")
+# 09(권한·조회 범위·증빙 발행 원문)를 빼면 본인 주문 확인·현금영수증·픽업 질문에 답하지 못하므로 포함.
+# 10(인터뷰 진술 원문)은 문서와 충돌 시 문서가 우선이고 크기가 커서 제외
+KNOWLEDGE_GLOB = os.getenv("KNOWLEDGE_GLOB", "0[0-9]_*.md")
 # 멀티턴: 같은 사용자의 최근 대화만 이어 붙임. 오래된 대화까지 넣으면 입력이 커져 응답이 느려짐
 HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "6"))
 HISTORY_WINDOW_MIN = int(os.getenv("HISTORY_WINDOW_MIN", "30"))
@@ -272,7 +274,13 @@ async def on_message(d: dict, agent: ClaudeAgent, conversation_log: Conversation
                 # 문맥 조회가 실패해도 단발 답변은 보내야 하므로 빈 문맥으로 진행
                 log.error("conversation history read failed — %s", e)
 
-        reply = await agent.reply(content, history)
+        try:
+            reply = await agent.reply(content, history)
+        except Exception:
+            # 메시지마다 별도 Task라 예외가 새면 로그도 콜백도 없이 끝나 고객은 무응답을 겪음.
+            # 예상 못 한 예외라도 안내 문구는 보내고 원인은 traceback으로 남김
+            log.exception("reply generation failed")
+            reply = AgentReply(agent.fallback_reply, "error")
         callback_status: int | None = None
         try:
             callback_status = await send_callback(callback_token, reply.text)

@@ -140,3 +140,25 @@ def test_back_to_back_messages_from_same_customer_see_previous_answer(bot, conve
 
     second_call = messages.calls[1]["messages"]
     assert [m["content"] for m in second_call] == ["옥돔이 녹아서 왔어요", "주문번호 알려주세요", "100400001이에요"]
+
+
+def test_unexpected_error_still_sends_fallback_instead_of_silence(bot, conversation_log, monkeypatch):
+    # 처리 중 예상 못 한 예외가 나도 고객은 무응답이 아니라 안내 문구를 받아야 함 (60초 무응답 = 케이스 종료)
+    class BrokenMessages:
+        async def create(self, **kwargs):
+            raise RuntimeError("unexpected response shape")
+
+    client = SimpleNamespace(beta=SimpleNamespace(messages=BrokenMessages()))
+    agent = bot.ClaudeAgent(client, "규칙", FALLBACK, max_concurrent=1)
+    sent: list[str] = []
+
+    async def fake_callback(callback_token, text):
+        sent.append(text)
+        return 200
+
+    monkeypatch.setattr(bot, "send_callback", fake_callback)
+    event = {"content": "홍보걸 라이브 20% 코드 주세요", "callbackToken": "t1", "botUserKey": "user-a"}
+
+    asyncio.run(bot.on_message(event, agent, conversation_log))
+
+    assert sent == [FALLBACK]
