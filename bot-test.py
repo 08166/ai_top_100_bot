@@ -432,9 +432,9 @@ async def main():
 
     knowledge_files = sorted(KNOWLEDGE_DIR.glob(KNOWLEDGE_GLOB))
     if not knowledge_files:
-        # 지식 없이 뜨면 근거 없는 답만 하게 되므로 시작 단계에서 멈춤
-        log.error("지식 파일이 없습니다 — %s/%s", KNOWLEDGE_DIR, KNOWLEDGE_GLOB)
-        sys.exit(1)
+        # 종료하면 restart 정책 때문에 재시작만 반복하며 무응답이 되므로, 경고를 남기고
+        # 시스템 프롬프트만으로 계속 응답한다 (지식 파일은 scp로 별도 전달)
+        log.error("지식 파일이 없습니다 — %s/%s, 시스템 프롬프트만으로 응답", KNOWLEDGE_DIR, KNOWLEDGE_GLOB)
     system_prompt = build_system_prompt(SYSTEM_PROMPT_PATH.read_text(encoding="utf-8"), knowledge_files)
     fallback_reply = FALLBACK_REPLY_PATH.read_text(encoding="utf-8").strip()
 

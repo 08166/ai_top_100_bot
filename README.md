@@ -137,7 +137,7 @@ poetry add --group test {패키지}     # 테스트 전용 의존성
    scp knowledge/0*.md {서버}:~/symposium/ai_top_100_bot/knowledge/
    ssh {서버} 'chmod 644 ~/symposium/ai_top_100_bot/knowledge/*.md'
    ```
-   - 시스템 프롬프트에는 `KNOWLEDGE_GLOB`(기본 `0[0-8]_*.md`)에 맞는 파일만 들어감. 파일이 하나도 없으면 봇이 시작하지 않음
+   - 시스템 프롬프트에는 `KNOWLEDGE_GLOB`(기본 `0[0-8]_*.md`)에 맞는 파일만 들어감. 파일이 하나도 없으면 에러 로그(`지식 파일이 없습니다`)를 남기고 시스템 프롬프트만으로 응답하므로, 배포 후 로그에서 `knowledge=N files`가 0이 아닌지 확인한다
 1. 배포 (코드 변경 시마다)
    ```sh
    cd ~/symposium/ai_top_100_bot
