@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -39,7 +40,8 @@ CONVERSATION_DB_PATH = BASE_DIR / os.getenv("CONVERSATION_DB_PATH", "data/conver
 KAKAO_GW_URL = "wss://bot-gateway.kakao.com/gateway"
 KAKAO_API_URL = "https://kapi.kakao.com"
 # 카카오 SimpleText 계약상 text는 최대 1000자
-SIMPLE_TEXT_MAX_CHARS = 1000
+# 심사에서 500자를 넘는 말풍선은 채점에서 빠지므로 프롬프트는 480자, 전송은 500자로 막는다.
+SIMPLE_TEXT_MAX_CHARS = 500
 
 # ── Opcodes ──────────────────────────────────────────────────────────
 OP_DISPATCH = 0
@@ -68,7 +70,7 @@ _inflight: set[asyncio.Task] = set()
 class AgentReply:
     """Claude 답변과 기록에 남길 처리 결과."""
     text: str
-    outcome: str                 # ok | fallback | refusal | error
+    outcome: str                 # ok | truncated | fallback | refusal | blocked | error
     request_id: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -143,7 +145,9 @@ class ClaudeAgent:
                 response = await self.client.beta.messages.create(
                     model=CLAUDE_MODEL,
                     max_tokens=CLAUDE_MAX_TOKENS,
-                    system=self.system_prompt,
+                    # 지식이 담긴 긴 시스템 프롬프트를 캐시해서 응답 지연(p95)을 줄임
+                    system=[{"type": "text", "text": self.system_prompt,
+                             "cache_control": {"type": "ephemeral"}}],
                     messages=[{"role": "user", "content": user_text}],
                     output_config={"effort": CLAUDE_EFFORT},
                     # 안전 분류기가 거절하면 서버가 대체 모델로 다시 시도
@@ -165,7 +169,26 @@ class ClaudeAgent:
         text = "".join(b.text for b in response.content if b.type == "text").strip()
         if not text:
             return AgentReply(self.fallback_reply, "fallback", *usage)
-        return AgentReply(text[:SIMPLE_TEXT_MAX_CHARS], "ok", *usage)
+        # 프롬프트 원문이 새어 나가는 답은 보내지 않음 (OWASP LLM07 System Prompt Leakage)
+        if any(marker in text for marker in PROMPT_LEAK_MARKERS):
+            log.warning("prompt leak blocked — request_id=%s", response._request_id)
+            return AgentReply(self.fallback_reply, "blocked", *usage)
+        cleaned = sanitize_reply(text)
+        if len(cleaned) > SIMPLE_TEXT_MAX_CHARS:
+            log.warning("[SYSTEM] reply over %d chars (%d) — truncated, request_id=%s",
+                        SIMPLE_TEXT_MAX_CHARS, len(cleaned), response._request_id)
+            return AgentReply(cleaned[:SIMPLE_TEXT_MAX_CHARS], "truncated", *usage)
+        return AgentReply(cleaned, "ok", *usage)
+
+
+# SimpleText는 마크다운을 렌더링하지 않으므로 기호를 지워 글자 수도 줄임
+MARKDOWN_PATTERN = re.compile(r"\*\*|__|`|^#{1,6}\s*|^\s*[-*]\s+", re.MULTILINE)
+PROMPT_LEAK_MARKERS = ("[지식]", "[답변 원칙]", "=== 0")
+
+
+def sanitize_reply(text: str) -> str:
+    cleaned = MARKDOWN_PATTERN.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
 # ── 메시지 처리 ──────────────────────────────────────────────────────
